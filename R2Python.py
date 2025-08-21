@@ -1,148 +1,132 @@
 """
-R-to-Python Converter (Advanced)
+Advanced R to Python Converter
 --------------------------------
-This script converts R code into Python code (line by line).
-It focuses on:
- - Data frame operations (merge, subset, rbind, cbind, unique, col deletion)
- - Loops (for, while, apply-like constructs)
- - Conditionals (if/else)
- - Functions (def)
- - Error handling (stop() -> raise Exception)
- - Naming conventions (dots -> underscores, PEP8 compliance)
- - Date/time (today, yesterday, Sys.time, etc.)
+- Handles vectors, data frames, loops, functions, if/else
+- Proper Python indentation
+- Merge, subset, rbind/cbind, unique, grep, list.files, names
+- stop() -> raise Exception
+- Column names: dots -> underscores
 """
 
 import re
+import os
 import sys
 from datetime import datetime, timedelta
 
-def convert_r_to_python(r_file, py_file):
-    with open(r_file, "r", encoding="utf-8") as f:
-        r_lines = f.readlines()
+INDENT = 0
 
-    py_lines = []
+def indent_line(line):
+    return "    " * INDENT + line
 
-    for line in r_lines:
-        original_line = line.strip()
+def to_snake_case(name):
+    name = name.replace(".", "_")
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    return name.lower()
 
-        # Skip empty/comment lines
-        if original_line.startswith("#") or not original_line:
-            py_lines.append("# " + original_line + "\n")
-            continue
+def convert_line(line):
+    global INDENT
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return indent_line("# " + line)
 
-        # --- Handle common R to Python conversions ---
+    # --- Assignment & vectors ---
+    line = re.sub(r'(\w+)\s*<-\s*c\((.+)\)', lambda m: f'{to_snake_case(m.group(1))} = [{m.group(2)}]', line)
+    line = line.replace("<-", "=")
 
-        # Stop -> raise
-        line = re.sub(r'stop\((.*)\)', r'raise Exception(\1)', original_line)
+    # --- Logical ---
+    line = line.replace("TRUE", "True").replace("FALSE", "False").replace("NA", "None").replace("NULL", "None")
 
-        # Print
-        line = re.sub(r'print\((.*)\)', r'print(\1)', line)
+    # --- Column access df$col ---
+    line = re.sub(r'(\w+)\$(\w+)', lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]', line)
 
-        # %in% -> isin
-        line = re.sub(r'(\w+)\s*%in%\s*(\w+)', r'\1.isin(\2)', line)
+    # --- Chained NULL deletion ---
+    match = re.findall(r'(\w+)\["(\w+)"\]\s*=\s*None', line)
+    if match:
+        df = match[0][0]
+        cols = [to_snake_case(m[1]) for m in match]
+        line = f'{df} = {df}.drop(columns={cols})'
 
-        # %ni% -> ~isin
-        line = re.sub(r'(\w+)\s*%ni%\s*(\w+)', r'~\1.isin(\2)', line)
+    # --- Merge ---
+    if "merge(" in line:
+        line = line.replace("all.x=True", "how='left'").replace("all.y=True", "how='right'")
+        line = line.replace("all=True", "how='outer'").replace("all=False", "how='inner'")
+        # default inner if no how
+        if "how=" not in line:
+            line = re.sub(r'merge\((.+?)\)', r'pd.merge(\1, how="inner")', line)
 
-        # NA handling
-        line = line.replace("is.na", "pd.isna")
-        line = line.replace("!pd.isna", "~pd.isna")
-
-        # TRUE/FALSE -> True/False
-        line = line.replace("TRUE", "True").replace("FALSE", "False")
-
-        # Assignment <- to =
-        line = line.replace("<-", "=")
-
-        # --- Handle column access ---
-        # Replace df$col with df["col"]
-        line = re.sub(
-            r'(\w+)\$(\w+)',
-            lambda m: f'{m.group(1)}["{m.group(2).replace(".", "_")}"]',
-            line
-        )
-
-        # --- Handle chained NULL deletion ---
-        match = re.match(r'(\w+)\[\"(\w+)\"\]\s*=\s*\1\[\"(\w+)\"\]\s*=\s*NULL', line)
+    # --- Subset ---
+    if line.startswith("subset("):
+        match = re.match(r'subset\((\w+),\s*(.+)\)', line)
         if match:
-            df, col1, col2 = match.group(1), match.group(2), match.group(3)
-            line = f'{df} = {df}.drop(columns=["{col1}", "{col2}"])'
+            df, cond = match.groups()
+            # Convert column names in condition
+            cond = re.sub(r'(\w+)\$(\w+)', lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]', cond)
+            # Convert !is.na
+            cond = cond.replace("!is.na(", "").replace(")", ".notna()")
+            line = f'{df}[{cond}]'
 
-        # Single NULL deletion
-        match = re.match(r'(\w+)\[\"(\w+)\"\]\s*=\s*NULL', line)
-        if match:
-            df, col = match.group(1), match.group(2)
-            line = f'{df} = {df}.drop(columns=["{col}"])'
+    # --- rbind / cbind ---
+    line = re.sub(r'rbind\((.+)\)', r'pd.concat([\1], axis=0)', line)
+    line = re.sub(r'cbind\((.+)\)', r'pd.concat([\1], axis=1)', line)
 
-        # --- Handle merge ---
-        if "merge(" in line:
-            # Example: merge(df1, df2, by="id", all.x=TRUE)
-            line = re.sub(r'merge\((.*)\)', r'pd.merge(\1)', line)
-            line = line.replace("all.x=True", "how='left'")
-            line = line.replace("all.y=True", "how='right'")
-            line = line.replace("all=True", "how='outer'")
-            line = line.replace("all=False", "how='inner'")
+    # --- Unique ---
+    line = re.sub(r'unique\((.+)\)', r'pd.Series(\1).unique()', line)
 
-        # --- Handle rbind -> pd.concat([...], axis=0) ---
-        if line.startswith("rbind("):
-            line = re.sub(r'rbind\((.*)\)', r'pd.concat([\1], axis=0)', line)
+    # --- grep / list.files ---
+    line = re.sub(r'grep\((.+?),\s*(.+)\)', r'[i for i in \2 if re.search(\1, i)]', line)
+    line = re.sub(r'list\.files\((.+?)\)', r'os.listdir(\1)', line)
 
-        # --- Handle cbind -> pd.concat([...], axis=1) ---
-        if line.startswith("cbind("):
-            line = re.sub(r'cbind\((.*)\)', r'pd.concat([\1], axis=1)', line)
+    # --- names(df) ---
+    line = re.sub(r'names\((\w+)\)', r'\1.columns', line)
 
-        # --- Handle unique ---
-        if "unique(" in line:
-            line = re.sub(r'unique\((.*)\)', r'pd.Series(\1).unique()', line)
+    # --- Stop/Error ---
+    line = re.sub(r'stop\((.+)\)', r'raise Exception(\1)', line)
 
-        # --- Handle subset ---
-        if line.startswith("subset("):
-            # Very simple handling: subset(df, condition)
-            match = re.match(r'subset\((\w+),\s*(.*)\)', line)
-            if match:
-                df, condition = match.group(1), match.group(2)
-                line = f'{df}[{condition}]'
+    # --- Functions ---
+    line = re.sub(r'(\w+)\s*=\s*function\((.*)\)', lambda m: f'def {to_snake_case(m.group(1))}({m.group(2)}):', line)
+    if "function(" in line:
+        line = line.replace("function(", "def ")
 
-        # --- Handle function definitions ---
-        if line.startswith("function(") or "= function(" in line:
-            line = re.sub(r'(\w+)\s*=\s*function\((.*)\)', r'def \1(\2):', line)
+    # --- If / Else ---
+    line = re.sub(r'if\s*\((.*)\)\s*{?', r'if \1:', line)
+    line = re.sub(r'else if\s*\((.*)\)\s*{?', r'elif \1:', line)
+    line = re.sub(r'else\s*{?', 'else:', line)
 
-        # --- Handle loops ---
-        # for (i in 1:n) -> for i in range(1, n+1):
-        match = re.match(r'for\s*\((\w+)\s+in\s+(\d+):(\d+)\)', line)
-        if match:
-            var, start, end = match.groups()
-            line = f'for {var} in range({start}, {int(end)+1}):'
+    # --- Loops ---
+    match = re.match(r'for\s*\((\w+)\s+in\s+(\d+):(\d+)\)', line)
+    if match:
+        var, start, end = match.groups()
+        line = f'for {var} in range({start}, {int(end)+1}):'
+    line = re.sub(r'while\s*\((.+)\)', r'while \1:', line)
 
-        # while loop stays same (just Python syntax)
-        line = line.replace("while (", "while (")
+    # --- Date / Time ---
+    line = line.replace("Sys.Date()", "datetime.today().date()")
+    line = line.replace("Sys.time()", "datetime.now()")
 
-        # --- Handle date/time ---
-        if "Sys.Date()" in line:
-            line = line.replace("Sys.Date()", "datetime.today().date()")
-        if "Sys.time()" in line:
-            line = line.replace("Sys.time()", "datetime.now()")
-        if "today()" in line.lower():
-            line = line.replace("today()", "datetime.today().date()")
-        if "yesterday()" in line.lower():
-            line = line.replace("yesterday()", "(datetime.today() - timedelta(days=1)).date()")
+    return indent_line(line)
 
-        # --- Add line to output ---
-        py_lines.append(line + "\n")
 
-    # Write to output file
-    with open(py_file, "w", encoding="utf-8") as f:
-        f.writelines(py_lines)
+def convert_r_file(r_file, py_file):
+    global INDENT
+    INDENT = 0
+    with open(r_file, "r") as f:
+        lines = f.readlines()
 
-    print(f"✅ Conversion complete. Python script saved at: {py_file}")
+    py_code = []
+    py_code.append("import pandas as pd\nimport numpy as np\nimport os\nimport re\nfrom datetime import datetime, timedelta\n\n")
+
+    for line in lines:
+        converted = convert_line(line)
+        py_code.append(converted + "\n")
+
+    with open(py_file, "w") as f:
+        f.writelines(py_code)
+
+    print(f"✅ Conversion complete: {py_file}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python r2py_converter.py input.R output.py")
         sys.exit(1)
-
-    r_file = sys.argv[1]
-    py_file = sys.argv[2]
-
-    convert_r_to_python(r_file, py_file)
+    convert_r_file(sys.argv[1], sys.argv[2])
