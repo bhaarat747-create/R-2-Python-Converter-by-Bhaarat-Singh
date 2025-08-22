@@ -1,143 +1,159 @@
 import re
-import pandas as pd
+import os
 
-def r_to_python(r_code):
-    # Pre-process to put braces and 'else' on separate lines
-    r_code = r_code.replace('} else if', '}\nelse if')
-    r_code = r_code.replace('} else', '}\nelse')
-    r_code = r_code.replace('{', '{\n')
-    r_code = r_code.replace('}', '}\n')
-    lines = r_code.split('\n')
-    
-    py_lines = []
-    indent_level = 0
-    indent_str = '    '  # four spaces for indentation
-    
-    for raw_line in lines:
-        if not raw_line.strip():
-            continue
-        stripped = raw_line.strip()
-        close_count = raw_line.count('}')
-        
-        # If a line starts with '}', we reduce indent before processing content
-        if stripped.startswith('}'):
-            indent_level -= close_count
-            indent_level = max(indent_level, 0)
-            continue
-        
-        # If a line ends with '}', reduce indent after writing the line
-        reduce_after = stripped.endswith('}')
-        
-        # Remove any braces and trim whitespace
-        line = raw_line.replace('{', '').replace('}', '').strip()
-        if not line:
-            continue
-        
-        # Handle 'else if' and 'else' specially
-        if line.startswith('else if'):
-            m = re.match(r'else if\s*\((.*)\)', line)
-            if m:
-                condition = m.group(1)
-                line = f'elif {condition}:'
-        elif line.startswith('else'):
-            line = 'else:'
-        else:
-            # Replace assignment operators
-            line = re.sub(r'<-', '=', line)
-            line = re.sub(r'->', '=', line)
-            # Replace $ with Python dict-like access (and dots in names to underscores)
-            def replace_dollar(match):
-                df, col = match.group(1), match.group(2)
-                col_py = col.replace('.', '_')
-                return f'{df}["{col_py}"]'
-            line = re.sub(r'(\w+)\$([\w\.]+)', replace_dollar, line)
-            # Replace c(...) with Python list [...]
-            def replace_c(match):
-                items = [x.strip() for x in match.group(1).split(',')]
-                return "[" + ", ".join(items) + "]"
-            line = re.sub(r'c\(([^)]*)\)', replace_c, line)
-            # Data frame subsetting patterns (all rows, select columns)
-            line = re.sub(r'(\w+)\s*=\s*(\w+)\s*\[\s*,\s*\[', r'\1 = \2[[', line)
-            line = re.sub(r'(\w+)\s*\[\s*,\s*\[', r'\1[[', line)
-            # unique() to pandas unique
-            line = re.sub(r'unique\(', r'pd.unique(', line)
-            # rbind/cbind to pandas.concat
-            def replace_rbind(match):
-                args = [arg.strip() for arg in match.group(1).split(',')]
-                return f'pd.concat([{", ".join(args)}], ignore_index=True)'
-            line = re.sub(r'rbind\(([^\)]*)\)', replace_rbind, line)
-            def replace_cbind(match):
-                args = [arg.strip() for arg in match.group(1).split(',')]
-                return f'pd.concat([{", ".join(args)}], axis=1)'
-            line = re.sub(r'cbind\(([^\)]*)\)', replace_cbind, line)
-            # data.frame(...) to pd.DataFrame({...})
-            def replace_df(match):
-                content = match.group(1)
-                items = [item.strip() for item in content.split(',')]
-                dict_items = []
-                for item in items:
-                    if '=' in item:
-                        k, v = [p.strip() for p in item.split('=', 1)]
-                        dict_items.append(f"'{k}': {v}")
-                    else:
-                        dict_items.append(item)
-                return f"pd.DataFrame({{{', '.join(dict_items)}}})"
-            line = re.sub(r'data\.frame\(([^\)]*)\)', replace_df, line)
-            # Logical operators
-            line = re.sub(r'&&', ' and ', line)
-            line = re.sub(r'\|\|', ' or ', line)
-            # Negation '!' to 'not ' (careful not to break '!=')
-            line = re.sub(r'!=(?!=)', '!=', line)  # no change, but to be safe
-            line = re.sub(r'!(?!=)', 'not ', line)
-            # If, for, and while loops
-            m_if = re.match(r'if\s*\((.*)\)', line)
-            if m_if:
-                cond = m_if.group(1)
-                line = f'if {cond}:'
-            m_for = re.match(r'for\s*\(\s*(\w+)\s+in\s+([^\)]+)\)', line)
-            if m_for:
-                var, expr = m_for.group(1), m_for.group(2)
-                # Convert R's a:b to range(a, b+1)
-                expr = re.sub(r'(\d+)\s*:\s*(\d+)', 
-                              lambda m: f'range({m.group(1)}, {int(m.group(2))+1})', expr)
-                line = f'for {var} in {expr}:'
-            m_while = re.match(r'while\s*\((.*)\)', line)
-            if m_while:
-                cond = m_while.group(1)
-                line = f'while {cond}:'
-            # cat() -> print()
-            line = re.sub(r'(?<!\w)cat\(', 'print(', line)
-            # Constants TRUE/FALSE/NA
-            line = re.sub(r'\bTRUE\b', 'True', line)
-            line = re.sub(r'\bFALSE\b', 'False', line)
-            line = re.sub(r'\bNA\b', 'None', line)
-            # Remove trailing semicolon
-            line = line.rstrip(';')
-            # Convert lone a:b to range(a, b+1)
-            line = re.sub(r'(\d+)\s*:\s*(\d+)', r'range(\1, \2+1)', line)
-        
-        # Add the (possibly indented) Python line to output
-        indent_str_line = indent_str * indent_level
-        py_lines.append(indent_str_line + line)
-        # If the line ends with ':', increase indentation for the next line
-        if line.endswith(':'):
-            indent_level += 1
-        # After writing the line, if we flagged a closing '}', reduce indent
-        if reduce_after:
-            indent_level -= close_count
-            indent_level = max(indent_level, 0)
-    
-    return '\n'.join(py_lines)
+# =========================
+# Utility functions
+# =========================
 
-# Example usage:
-r_code = '''
-df <- data.frame(id=1:3, x=c("a","b","c"))
-df2 <- data.frame(id=4:5, x=c("d","e"))
-out <- rbind(df, df2)
-if(nrow(out) > 3) {
-    cat("Large data frame")
-} else {
-    cat("Small")
-}
-'''
-print(r_to_python(r_code))
+def to_snake_case(name: str) -> str:
+    """Convert R-style names with dots to Python snake_case"""
+    return re.sub(r'[\.\-]', '_', name)
+
+
+def handle_assignment(line: str) -> str:
+    """Convert R assignment <- or = to Python ="""
+    line = re.sub(r'\s*<-\s*', ' = ', line)
+    return line
+
+
+def handle_vectors(line: str) -> str:
+    """Convert R vectors c("a","b") to Python lists ["a","b"]"""
+    return re.sub(r'c\((.*?)\)', r'[\1]', line)
+
+
+def handle_dataframes(line: str) -> str:
+    """Handle R dataframe syntax: $, column removal, subset of cols"""
+    # df$col -> df["col"]
+    line = re.sub(r'(\w+)\$(\w+)', lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]', line)
+    
+    # Remove columns: df$col1 <- df$col2 <- NULL
+    if "<- NULL" in line:
+        cols = re.findall(r'(\w+)\$(\w+)', line)
+        if cols:
+            df = cols[0][0]
+            col_list = [f'"{to_snake_case(c[1])}"' for c in cols]
+            return f'{df}.drop(columns=[{", ".join(col_list)}], inplace=True)'
+    
+    # Column subset: df <- df[, c("id","name")]
+    match = re.match(r'(\w+)\s*=\s*\1\[, *c\((.*?)\)\]', line)
+    if match:
+        df = match.group(1)
+        cols = match.group(2).replace('"', "'")
+        return f'{df} = {df}[[{cols}]]'
+    
+    return line
+
+
+def handle_merge(line: str) -> str:
+    """Convert R merge() to pandas merge()"""
+    if "merge(" not in line:
+        return line
+    
+    # Default = inner join
+    how = "inner"
+    by = None
+    left, right = "left", "right"
+    
+    # Parse args
+    if "all.x=TRUE" in line:
+        how = "left"
+    if "all.y=TRUE" in line:
+        how = "right"
+    if "all=TRUE" in line:
+        how = "outer"
+    if "by=" in line:
+        by = re.findall(r'by\s*=\s*c?\((.*?)\)', line)
+        if by:
+            by = by[0].replace('"', "'")
+    
+    # Extract dataframes
+    args = re.findall(r'merge\(([^,]+),([^,\)]+)', line)
+    if args:
+        left, right = [a.strip() for a in args[0]]
+    
+    merge_expr = f"{left}.merge({right}, how='{how}'"
+    if by:
+        merge_expr += f", on=[{by}]"
+    merge_expr += ")"
+    
+    return re.sub(r'merge\(.*\)', merge_expr, line)
+
+
+def handle_functions(line: str) -> str:
+    """Convert R function definitions and stop()"""
+    # function definition
+    line = re.sub(r'(\w+)\s*=\s*function\s*\((.*?)\)', lambda m: f'def {to_snake_case(m.group(1))}({m.group(2)}):', line)
+    # stop("msg") -> raise Exception("msg")
+    line = re.sub(r'stop\((.*?)\)', r'raise Exception(\1)', line)
+    return line
+
+
+def handle_controls(line: str) -> str:
+    """Handle if, for, while, braces"""
+    # Convert if (...) {  -> if ...:
+    line = re.sub(r'if\s*\((.*?)\)\s*\{?', r'if \1:', line)
+    # Convert for (x in seq) {  -> for x in seq:
+    line = re.sub(r'for\s*\((\w+)\s+in\s+(.*?)\)\s*\{?', r'for \1 in \2:', line)
+    # while loop
+    line = re.sub(r'while\s*\((.*?)\)\s*\{?', r'while \1:', line)
+    # Remove closing brace
+    line = line.replace("}", "")
+    return line
+
+
+def handle_misc(line: str) -> str:
+    """Miscellaneous translations"""
+    line = re.sub(r'!is\.na\((.*?)\)', r'~\1.isna()', line)
+    line = re.sub(r'is\.na\((.*?)\)', r'\1.isna()', line)
+    line = re.sub(r'unique\((.*?)\)', r'\1.drop_duplicates()', line)
+    line = re.sub(r'rbind\((.*?)\)', r'pd.concat([\1])', line)
+    line = re.sub(r'cbind\((.*?)\)', r'pd.concat([\1], axis=1)', line)
+    line = re.sub(r'names\((.*?)\)', r'list(\1.columns)', line)
+    line = re.sub(r'list\.files\((.*?)\)', r'os.listdir(\1)', line)
+    line = re.sub(r'grep\((.*?),(.*?)\)', r'[x for x in \2 if re.search(\1, x)]', line)
+    line = re.sub(r'%in%', ' in ', line)
+    line = re.sub(r'%ni%', ' not in ', line)
+    return line
+
+
+# =========================
+# Main Converter
+# =========================
+
+def convert_r_to_python(input_file: str, output_file: str):
+    """Read an R script and convert it to Python"""
+    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+        outfile.write("import pandas as pd\nimport numpy as np\nimport os\nimport re\nimport datetime as dt\n\n")
+        
+        indent_level = 0
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            
+            original = line  # keep for debugging
+            line = handle_assignment(line)
+            line = handle_vectors(line)
+            line = handle_dataframes(line)
+            line = handle_merge(line)
+            line = handle_functions(line)
+            line = handle_controls(line)
+            line = handle_misc(line)
+            
+            # Adjust indentation based on control flow
+            if line.endswith(":"):
+                outfile.write("    " * indent_level + line + "\n")
+                indent_level += 1
+            else:
+                outfile.write("    " * indent_level + line + "\n")
+    
+    print(f"✅ Conversion complete. Output saved to {output_file}")
+
+
+# =========================
+# Example Usage
+# =========================
+if __name__ == "__main__":
+    input_file = "demo_full.R"   # Place R script in same folder
+    output_file = os.path.splitext(input_file)[0] + "_converted.py"
+    convert_r_to_python(input_file, output_file)
