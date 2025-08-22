@@ -13,26 +13,29 @@ def to_snake_case(name: str) -> str:
 
 def preserve_strings(code: str):
     """
-    Replace all string literals with placeholders so they don't get mangled
-    by regexes. Returns (masked_code, dict_of_placeholders).
+    Mask all string literals ("..." or '...') to __STR_n__ placeholders.
     """
     strings = {}
     def repl(m):
-        key = f"__STR{len(strings)}__"
+        key = f"__STR_{len(strings)}__"
         strings[key] = m.group(0)
         return key
-    masked = re.sub(r'"[^"]*"|\'[^\']*\'', repl, code)
+    masked = re.sub(r'''("([^"\\]
+
+|\\.)*")|('([^'\\]
+
+|\\.)*')''', repl, code)
     return masked, strings
 
-def restore_strings(code: str, strings: dict):
-    for key, val in strings.items():
-        code = code.replace(key, val)
+def restore_strings(code: str, strings: dict) -> str:
+    """
+    Restore placeholders back to original literals (longest keys first).
+    """
+    for key in sorted(strings.keys(), key=len, reverse=True):
+        code = code.replace(key, strings[key])
     return code
 
 def split_code_and_comment(line: str):
-    """
-    Separates a line into (code, comment), where comment includes the '#' if present.
-    """
     parts = line.split("#", 1)
     if len(parts) == 1:
         return parts[0], ""
@@ -41,125 +44,213 @@ def split_code_and_comment(line: str):
 # -----------------------------
 # Preprocessing
 # -----------------------------
-def preprocess(code: str) -> str:
-    # 1) mask strings
-    code, string_map = preserve_strings(code)
-    # 2) normalize assignments
-    code = re.sub(r'(<-|->)', '=', code)
-    # 3) normalize variable names (camelCase & dots → snake_case)
+def preprocess(r_code: str):
+    masked, str_map = preserve_strings(r_code)
+    # assignments
+    masked = re.sub(r'(<-|->)', '=', masked)
+    # normalize variable names outside comments
     lines = []
-    for ln in code.split("\n"):
+    for ln in masked.split("\n"):
         code_part, comment = split_code_and_comment(ln)
         if code_part.strip().startswith("#") or not code_part.strip():
             lines.append(ln)
         else:
-            snake = to_snake_case(code_part)
-            lines.append(snake + comment)
-    masked = "\n".join(lines)
-    return masked, string_map
+            lines.append(to_snake_case(code_part) + comment)
+    return "\n".join(lines), str_map
 
 # -----------------------------
 # Transformations
 # -----------------------------
+def transform_logical_ops(line: str) -> str:
+    # scalar logical
+    line = re.sub(r'&&', 'and', line)
+    line = re.sub(r'\|\|', 'or', line)
+    return line
+
+def transform_chained_null_drops(line: str) -> str:
+    """
+    df$col1 <- df$col2 <- NULL → df.drop(columns=["col1","col2"], inplace=True)
+    """
+    m = re.findall(r'(\w+)\$(\w+)\s*=\s*', line)
+    if m and line.strip().endswith("NULL"):
+        dfname = m[0][0]
+        cols = [to_snake_case(c) for (_, c) in m]
+        cols_list = ", ".join(f'"{c}"' for c in cols)
+        return f'{dfname}.drop(columns=[{cols_list}], inplace=True)'
+    return line
+
+def transform_new_column_assignment(line: str) -> str:
+    # df$col <- expr → df["col"] = expr
+    return re.sub(
+        r'(\w+)\$(\w+)\s*=\s*(.+)',
+        lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"] = {m.group(3).strip()}',
+        line
+    )
+
+def transform_na_fill(line: str) -> str:
+    # df$col[is.na(df$col)] <- val → df.loc[df["col"].isna(), "col"] = val
+    return re.sub(
+        r'(\w+)\$(\w+)\s*
+
+\[\s*is\.na\(\1\$\2\)\s*\]
+
+\s*=\s*(.+)',
+        lambda m: f'{m.group(1)}.loc[{m.group(1)}["{m.group(2)}"].isna(), "{m.group(2)}"] = {m.group(3).strip()}',
+        line
+    )
+
+def transform_ifelse(line: str) -> str:
+    # ifelse(cond, yes, no) → np.where(cond, yes, no)
+    return re.sub(
+        r'ifelse\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
+        r'np.where(\1, \2, \3)',
+        line
+    )
+
 def transform_functions(line: str) -> str:
-    # function definitions & stop()
     line = re.sub(r'(\w+)\s*=\s*function\s*\((.*?)\)', r'def \1(\2):', line)
+    line = re.sub(r'return\((.*?)\)', r'return \1', line)
     line = re.sub(r'stop\((.*?)\)', r'raise Exception(\1)', line)
     return line
 
+def transform_default_sysdate(line: str) -> str:
+    # myfunc <- function(x = Sys.Date()) → def myfunc(x=None):
+    line = re.sub(
+        r'(\w+)\s*=\s*function\s*\(\s*(\w+)\s*=\s*Sys\.Date\(\)\s*\)',
+        r'def \1(\2=None):', line
+    )
+    return line
+
 def transform_control(line: str) -> str:
-    # if / else if / else / for / while
     line = re.sub(r'^\s*if\s*\((.*?)\)\s*\{?$', r'if \1:', line)
     line = re.sub(r'^\s*else\s+if\s*\((.*?)\)\s*\{?$', r'elif \1:', line)
     line = re.sub(r'^\s*else\s*\{?$', r'else:', line)
-    line = re.sub(r'for\s*\((\w+)\s+in\s+(.*?)\)\s*\{?$', r'for \1 in \2:', line)
+    line = re.sub(r'for\s*\((\w+)\s+in\s+(\d+)\s*:\s*(\d+)\)', r'for \1 in range(\2, \3+1):', line)
     line = re.sub(r'while\s*\((.*?)\)\s*\{?$', r'while \1:', line)
     return line
 
 def transform_vectors(line: str) -> str:
     line = re.sub(r'c\((.*?)\)', r'[\1]', line)
-    line = re.sub(r'(\d+):(\d+)', r'range(\1, \2+1)', line)
-    # seq(start, end, [step])
+    line = re.sub(r'(\d+)\s*:\s*(\d+)', r'range(\1, \2+1)', line)
     def seq_repl(m):
-        start, end, step = m.group(1), m.group(2), m.group(3)
-        if step:
-            return f"range({start}, {end}+1, {step})"
-        return f"range({start}, {end}+1)"
-    return re.sub(r'seq\(\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)', seq_repl, line)
+        s, e, st = m.group(1), m.group(2), m.group(3)
+        if st:
+            return f'range({s}, {e}+1, {st})'
+        return f'range({s}, {e}+1)'
+    return re.sub(
+        r'seq\(\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)', seq_repl, line
+    )
 
-def transform_dataframe(line: str) -> str:
-    # $ access
+def transform_dataframe_access_and_names(line: str) -> str:
+    # df$col → df["col"]
     line = re.sub(r'(\w+)\$(\w+)', r'\1["\2"]', line)
-    # names(df) and names(df) <- c(...)
+    # names(df) <- c(...) and names(df)
     line = re.sub(r'names\((\w+)\)\s*=\s*c\((.*?)\)', r'\1.columns = [\2]', line)
     line = re.sub(r'names\((\w+)\)', r'\1.columns.tolist()', line)
-    # unique()
-    line = re.sub(r'unique\((.*?)\)', r'\1.unique()', line)
-    # rbind / cbind
-    line = re.sub(r'rbind\((.*?)\)', r'pd.concat([\1], axis=0)', line)
-    line = re.sub(r'cbind\((.*?)\)', r'pd.concat([\1], axis=1)', line)
-    # NULL drops chained
+    return line
+
+def transform_dataframe_subsetting(line: str) -> str:
+    # df["col_list"]
     line = re.sub(
-        r'(\w+)\s*=\s*(\w+)\s*=\s*NULL',
-        lambda m: f'{m.group(2)}.drop(columns=["{m.group(1)}"], inplace=True)',
+        r'(\w+)\s*
+
+\[\s*,\s*
+
+\[\s*(.*?)\s*\]
+
+\s*\]
+
+', r'\1[[\2]]', line
+    )
+    # df[, "col"]
+    line = re.sub(r'(\w+)\s*
+
+\[\s*,\s*["\'](.+?)["\']\s*\]
+
+', r'\1["\2"]', line)
+    # df[cond, ]
+    line = re.sub(r'(\w+)\s*
+
+\[\s*(.*?)\s*,\s*\]
+
+', r'\1.loc[\2, :]', line)
+    return line
+
+def transform_dataframe_drops(line: str) -> str:
+    # handle single-col NULL drop: df$col <- NULL
+    line = re.sub(
+        r'(\w+)\$(\w+)\s*=\s*NULL',
+        lambda m: f'{m.group(1)}.drop(columns=["{m.group(2)}"], inplace=True)',
         line
     )
+    return line
+
+def transform_dataframe_rbind_cbind(line: str) -> str:
+    line = re.sub(r'rbind\((.*?)\)', r'pd.concat([\1], axis=0)', line)
+    line = re.sub(r'cbind\((.*?)\)', r'pd.concat([\1], axis=1)', line)
     return line
 
 def handle_merge(line: str) -> str:
     if "merge(" not in line:
         return line
-    # extract base call
-    m = re.search(r'merge\(\s*([^,]+)\s*,\s*([^,)\s]+)(.*)\)', line)
+    m = re.search(r'merge\(\s*([^,]+)\s*,\s*([^,)\s]+)(.*?)\)', line)
     if not m:
         return line
     left, right, rest = m.group(1).strip(), m.group(2).strip(), m.group(3)
     how = 'inner'
-    if re.search(r'all\.x\s*=\s*TRUE', rest):
-        how = 'left'
-    if re.search(r'all\.y\s*=\s*TRUE', rest):
-        how = 'right'
-    if re.search(r'all\s*=\s*TRUE', rest):
-        how = 'outer'
+    if re.search(r'all\.x\s*=\s*TRUE', rest): how = 'left'
+    if re.search(r'all\.y\s*=\s*TRUE', rest): how = 'right'
+    if re.search(r'all\s*=\s*TRUE', rest): how = 'outer'
     on = left_on = right_on = None
     m_on = re.search(r'by\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_on:
-        on = to_snake_case(m_on.group(1))
+    if m_on: on = to_snake_case(m_on.group(1))
     m_l = re.search(r'by\.x\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_l:
-        left_on = to_snake_case(m_l.group(1))
+    if m_l: left_on = to_snake_case(m_l.group(1))
     m_r = re.search(r'by\.y\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_r:
-        right_on = to_snake_case(m_r.group(1))
-    # subset on right?
+    if m_r: right_on = to_snake_case(m_r.group(1))
     right = re.sub(r'(\w+)
 
 \[(.*?),(.*?)\]
 
 ', r'\1.loc[\2,\3]', right)
     args = [left, right, f'how="{how}"']
-    if on:
-        args.append(f'on="{on}"')
-    if left_on:
-        args.append(f'left_on="{left_on}"')
-    if right_on:
-        args.append(f'right_on="{right_on}"')
+    if on: args.append(f'on="{on}"')
+    if left_on: args.append(f'left_on="{left_on}"')
+    if right_on: args.append(f'right_on="{right_on}"')
     py = f'pd.merge({", ".join(args)})'
     return line.replace(m.group(0), py)
 
+def transform_sorting(line: str) -> str:
+    # df[order(df$col), ]
+    line = re.sub(
+        r'(\w+)\s*
+
+\[\s*order\(\s*\1\$(\w+)\s*\)\s*,\s*\]
+
+', r'\1.sort_values(by="\2")',
+        line
+    )
+    # df[order(df$col, decreasing=TRUE), ]
+    line = re.sub(
+        r'(\w+)\s*
+
+\[\s*order\(\s*\1\$(\w+)\s*,\s*decreasing\s*=\s*TRUE\)\s*,\s*\]
+
+',
+        r'\1.sort_values(by="\2", ascending=False)',
+        line
+    )
+    return line
+
 def transform_subset(line: str) -> str:
-    line = re.sub(r'subset\((\w+)\s*,\s*(.*?)\)', r'\1[\2]', line)
+    line = re.sub(r'subset\(\s*(\w+)\s*,\s*(.*?)\s*\)', r'\1[\2]', line)
     line = re.sub(r'is\.na\((.*?)\)', r'\1.isna()', line)
     line = re.sub(r'!\s*is\.na\((.*?)\)', r'\1.notna()', line)
-    # & | → and/or
-    line = re.sub(r'\s&\s', ' and ', line)
-    line = re.sub(r'\s\|\s', ' or ', line)
     return line
 
 def transform_membership(line: str) -> str:
     line = re.sub(r'(\w+)\s*%in%\s*c\((.*?)\)', r'\1.isin([\2])', line)
     line = re.sub(r'(\w+)\s*%ni%\s*c\((.*?)\)', r'~\1.isin([\2])', line)
-    # scalar context: x %in% [1,2]
     line = re.sub(r'(\w+)\s*%in%\s*
 
 \[\s*(.*?)\s*\]
@@ -172,11 +263,31 @@ def transform_membership(line: str) -> str:
 ', r'\1 not in [\2]', line)
     return line
 
+def transform_df_counts_and_summary(line: str) -> str:
+    line = re.sub(r'nrow\(\s*(\w+)\s*\)', r'len(\1)', line)
+    line = re.sub(r'ncol\(\s*(\w+)\s*\)', r'len(\1.columns)', line)
+    line = re.sub(r'dim\(\s*(\w+)\s*\)', r'\1.shape', line)
+    line = re.sub(r'summary\(\s*(\w+)\s*\)', r'\1.describe()', line)
+    return line
+
+def transform_aggregation(line: str) -> str:
+    line = re.sub(r'mean\(\s*(\w+)\$(\w+),\s*na\.rm\s*=\s*TRUE\)', r'\1["\2"].mean(skipna=True)', line)
+    line = re.sub(r'sum\(\s*(\w+)\$(\w+),\s*na\.rm\s*=\s*TRUE\)', r'\1["\2"].sum(skipna=True)', line)
+    return line
+
+def transform_apply_family(line: str) -> str:
+    line = re.sub(r'apply\(\s*(\w+)\s*,\s*1\s*,\s*(\w+)\)', r'\1.\2(axis=1)', line)
+    line = re.sub(r'sapply\(\s*(\w+)\$(\w+)\s*,\s*(\w+)\)', r'\1["\2"].apply(\3)', line)
+    line = re.sub(
+        r'lapply\(\s*(\w+)\s*,\s*function\(\w+\)\s*(\w+)\$(\w+)\)',
+        r'[\1_item["\3"] for \1_item in \1]',
+        line
+    )
+    return line
+
 def transform_io(line: str) -> str:
-    # read.csv, write.csv
     line = re.sub(r'read\.csv\((.*?)\)', r'pd.read_csv(\1)', line)
-    line = re.sub(r'write\.csv\((.*?),(.*?)\)', r'\2.to_csv(\1, index=False)', line)
-    # list.files()
+    line = re.sub(r'write\.csv\(\s*(.*?),(.*?)\)', r'\2.to_csv(\1, index=False)', line)
     line = re.sub(r'list\.files\(\s*pattern\s*=\s*["\'](.*?)["\']\s*\)', r'glob.glob("\1")', line)
     line = re.sub(r'grep\("(.+?)"\s*,\s*(\w+)\)', r'[x for x in \2 if re.search("\1", x)]', line)
     return line
@@ -184,17 +295,20 @@ def transform_io(line: str) -> str:
 def transform_dates(line: str) -> str:
     line = re.sub(r'Sys\.Date\(\)', r'datetime.date.today()', line)
     line = re.sub(r'Sys\.time\(\)', r'datetime.datetime.now()', line)
-    line = re.sub(r'Sys\.Date\(\)\s*-\s*(\d+)', r'datetime.date.today() - datetime.timedelta(days=\1)', line)
+    line = re.sub(
+        r'Sys\.Date\(\)\s*-\s*(\d+)',
+        r'datetime.date.today() - datetime.timedelta(days=\1)',
+        line
+    )
     return line
 
 def transform_factor(line: str) -> str:
     return re.sub(r'factor\((.*?)\)', r'pd.Categorical(\1)', line)
 
 def transform_s3_methods(line: str) -> str:
-    # print.classname <- function(x) {...} → class Classname: def __str__(self):
-    m = re.match(r'(\w+)\.(\w+)\s*=\s*function\s*\(\s*self\s*\)\s*:', line)
-    if m and m.group(1) == 'print':
-        cls = m.group(2).capitalize()
+    m = re.match(r'print\.(\w+)\s*=\s*function\s*\(\s*self\s*\)', line)
+    if m:
+        cls = m.group(1).capitalize()
         return f'class {cls}:\n    def __str__(self):'
     return line
 
@@ -206,115 +320,109 @@ def handle_pipe(line: str) -> str:
         return line
     parts = [p.strip() for p in line.split('%>%')]
     df = parts[0]
-    python_lines = []
+    out = []
     current = df
     group_key = None
-
     for step in parts[1:]:
         m = re.match(r'(\w+)\((.*)\)', step)
         if not m:
             continue
         op, args = m.group(1), m.group(2)
         if op == 'filter':
-            cond = transform_subset(args)
-            current = f'{current}[{cond}]'
+            out.append(f'{current} = {current}[{args}]')
         elif op == 'select':
             cols = args.replace('c(', '[').replace(')', ']')
-            current = f'{current}[[{cols.strip("[]")}]]'
+            out.append(f'{current} = {current}[[{cols.strip("[]")}]]')
         elif op == 'mutate':
             assigns = [a.strip() for a in args.split(',')]
             for a in assigns:
                 col, expr = a.split('=', 1)
-                python_lines.append(f'{current}["{col.strip()}"] = {expr.strip()}')
+                out.append(f'{current}["{col.strip()}"] = {expr.strip()}')
         elif op == 'arrange':
-            # arrange(col1, desc(col2))
-            cols = args.split(',')
-            sort_args = []
-            for c in cols:
-                c = c.strip()
-                if c.startswith('desc('):
-                    inner = c[len('desc('):-1]
-                    sort_args.append(f'"{inner.strip()}"', 'ascending=False')
-                else:
-                    sort_args.append(f'"{c}"')
-            current = f'{current}.sort_values([{", ".join(sort_args)}])'
+            cols = [c.strip() for c in args.split(',')]
+            asc = [c[5:-1] for c in cols if c.startswith('desc(')]
+            if asc:
+                out.append(f'{current} = {current}.sort_values(by={asc}, ascending=False)')
+            else:
+                out.append(f'{current} = {current}.sort_values(by={[c for c in cols]})')
         elif op == 'group_by':
             group_key = args.strip()
         elif op in ('summarise', 'summarize'):
-            # summarise(avg = mean(x))
-            agg = args.strip().split('=', 1)
-            outcol, funccall = agg[0].strip(), agg[1].strip()
-            funcname, inside = re.match(r'(\w+)\((.*?)\)', funccall).groups()
-            python_lines.append(
-                f'{current}.groupby("{group_key}")["{inside}"].{funcname}()'
-                f'.reset_index(name="{outcol}")'
+            out.append(
+                f'{current} = {current}.groupby("{group_key}")'
+                f'["{args.split("=")[1].strip(") ")}"].'
+                f'{args.split("(")[0]}()'
+                f'.reset_index(name="{args.split("=")[0].strip()}")'
             )
-        else:
-            # fallback to generic transform
-            python_lines.append(step)
-
-    # final state
-    python_lines.insert(0, f'{current}  # start of pipeline')
-    return '\n'.join(python_lines)
+    return "\n".join(out) if out else line
 
 # -----------------------------
-# Indentation Cleanup
+# Indentation Manager
 # -----------------------------
-def clean_indentation(lines: list[str]) -> list[str]:
-    """
-    Since we’re producing mostly top-level Python statements (no braces),
-    we just strip trailing '{' or '}' and ensure no residual indentation markers.
-    """
+def indent_code(lines, indent_str="    "):
+    indent_level = 0
     out = []
-    for ln in lines:
-        ln = ln.rstrip()
-        if ln.endswith('{'):
-            ln = ln[:-1].rstrip()
-        if ln == '}':
-            continue
-        out.append(ln)
+    dedent_keys = ("elif ", "else:", "except ", "finally:")
+    for raw in lines:
+        stripped = raw.lstrip()
+        if any(stripped.startswith(k) for k in dedent_keys):
+            indent_level = max(indent_level - 1, 0)
+        out.append(indent_str * indent_level + stripped)
+        if stripped.endswith(":"):
+            indent_level += 1
     return out
 
 # -----------------------------
 # Main Conversion Pipeline
 # -----------------------------
 def convert_r_to_python(r_code: str) -> str:
-    # 1) Preprocess
     masked, str_map = preprocess(r_code)
-    # 2) Line-by-line transforms
     out_lines = []
-    for raw_ln in masked.split("\n"):
-        code_part, comment = split_code_and_comment(raw_ln)
+    for raw in masked.split("\n"):
+        code_part, comment = split_code_and_comment(raw)
         ln = code_part
 
-        # skip empty or pure-comment lines
         if not ln.strip():
-            out_lines.append(raw_ln)
+            out_lines.append(raw)
             continue
 
-        # apply transforms in logical order
-        ln = transform_s3_methods(ln)
-        ln = transform_functions(ln)
-        ln = transform_control(ln)
-        ln = transform_vectors(ln)
-        ln = transform_dataframe(ln)
-        ln = handle_merge(ln)
-        ln = transform_subset(ln)
-        ln = transform_membership(ln)
-        ln = transform_io(ln)
-        ln = transform_dates(ln)
-        ln = transform_factor(ln)
-        ln = handle_pipe(ln)
+        for fn in (
+            transform_logical_ops,
+            transform_chained_null_drops,
+            transform_new_column_assignment,
+            transform_na_fill,
+            transform_ifelse,
+            transform_functions,
+            transform_default_sysdate,
+            transform_s3_methods,
+            transform_control,
+            transform_vectors,
+            transform_dataframe_access_and_names,
+            transform_dataframe_subsetting,
+            transform_dataframe_drops,
+            transform_dataframe_rbind_cbind,
+            handle_merge,
+            transform_sorting,
+            transform_subset,
+            transform_membership,
+            transform_df_counts_and_summary,
+            transform_aggregation,
+            transform_apply_family,
+            transform_io,
+            transform_dates,
+            transform_factor,
+            handle_pipe
+        ):
+            ln = fn(ln)
 
-        # reattach comment
         out_lines.append(ln + (" " + comment if comment else ""))
 
-    # 3) Clean up leftover braces/indent markers
-    cleaned = clean_indentation(out_lines)
-    result = "\n".join(cleaned)
-    # 4) restore strings
-    result = restore_strings(result, str_map)
-    # 5) add imports
+    # indent
+    indented = indent_code(out_lines)
+    joined = "\n".join(indented)
+    restored = restore_strings(joined, str_map)
+
+    # final imports
     imports = [
         "import pandas as pd",
         "import numpy as np",
@@ -323,7 +431,7 @@ def convert_r_to_python(r_code: str) -> str:
         "import os",
         "import re"
     ]
-    return "\n".join(imports) + "\n\n" + result
+    return "\n".join(imports) + "\n\n" + restored
 
 # -----------------------------
 # CLI Entry Point
@@ -333,7 +441,6 @@ if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python converter.py <input.R> <output.py>")
         sys.exit(1)
-
     inp, outp = sys.argv[1], sys.argv[2]
     with open(inp) as f:
         rtext = f.read()
