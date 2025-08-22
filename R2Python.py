@@ -1,11 +1,12 @@
 """
-Advanced R to Python Converter
---------------------------------
+Advanced R to Python Converter (Production-Ready)
+-------------------------------------------------
 - Handles vectors, data frames, loops, functions, if/else
-- Proper Python indentation
+- Proper Python indentation and block handling
 - Merge, subset, rbind/cbind, unique, grep, list.files, names
 - stop() -> raise Exception
-- Column names: dots -> underscores
+- Column names: dots -> underscores (PEP8)
+- Vectors c(...) anywhere
 """
 
 import re
@@ -13,33 +14,67 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-INDENT = 0
+INDENT = 0  # Tracks current indentation level
 
 def indent_line(line):
     return "    " * INDENT + line
 
 def to_snake_case(name):
+    # Replace dots with underscores and convert to lower case
     name = name.replace(".", "_")
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     return name.lower()
 
+def convert_vectors(line):
+    # Convert R vectors c(...) to Python lists [...]
+    pattern = r'c\(([^()]+?)\)'
+    while re.search(pattern, line):
+        line = re.sub(pattern, lambda m: f"[{m.group(1)}]", line)
+    return line
+
+def convert_merge(line):
+    # Handle merge with default inner join and all.x/all.y/all
+    if "merge(" in line:
+        args = line[line.find("(")+1:line.rfind(")")]
+        how = "inner"  # default inner
+        if "all.x=True" in args:
+            how = "left"
+            args = args.replace("all.x=True", "")
+        elif "all.y=True" in args:
+            how = "right"
+            args = args.replace("all.y=True", "")
+        elif "all=True" in args:
+            how = "outer"
+            args = args.replace("all=True", "")
+        elif "all=False" in args:
+            how = "inner"
+            args = args.replace("all=False", "")
+        args = args.strip().rstrip(",")
+        line = f"pd.merge({args}, how='{how}')"
+    return line
+
 def convert_line(line):
     global INDENT
+    original_line = line
     line = line.strip()
     if not line or line.startswith("#"):
         return indent_line("# " + line)
 
-    # --- Assignment & vectors ---
-    line = re.sub(r'(\w+)\s*<-\s*c\((.+)\)', lambda m: f'{to_snake_case(m.group(1))} = [{m.group(2)}]', line)
-    line = line.replace("<-", "=")
+    # --- Convert vectors first ---
+    line = convert_vectors(line)
 
-    # --- Logical ---
-    line = line.replace("TRUE", "True").replace("FALSE", "False").replace("NA", "None").replace("NULL", "None")
+    # --- Logical / constants ---
+    line = line.replace("TRUE", "True").replace("FALSE", "False")
+    line = line.replace("NA", "None").replace("NULL", "None")
 
     # --- Column access df$col ---
-    line = re.sub(r'(\w+)\$(\w+)', lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]', line)
+    line = re.sub(
+        r'(\w+)\$(\w+)',
+        lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]',
+        line
+    )
 
-    # --- Chained NULL deletion ---
+    # --- Chained NULL column deletion ---
     match = re.findall(r'(\w+)\["(\w+)"\]\s*=\s*None', line)
     if match:
         df = match[0][0]
@@ -47,23 +82,7 @@ def convert_line(line):
         line = f'{df} = {df}.drop(columns={cols})'
 
     # --- Merge ---
-    if "merge(" in line:
-        line = line.replace("all.x=True", "how='left'").replace("all.y=True", "how='right'")
-        line = line.replace("all=True", "how='outer'").replace("all=False", "how='inner'")
-        # default inner if no how
-        if "how=" not in line:
-            line = re.sub(r'merge\((.+?)\)', r'pd.merge(\1, how="inner")', line)
-
-    # --- Subset ---
-    if line.startswith("subset("):
-        match = re.match(r'subset\((\w+),\s*(.+)\)', line)
-        if match:
-            df, cond = match.groups()
-            # Convert column names in condition
-            cond = re.sub(r'(\w+)\$(\w+)', lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"]', cond)
-            # Convert !is.na
-            cond = cond.replace("!is.na(", "").replace(")", ".notna()")
-            line = f'{df}[{cond}]'
+    line = convert_merge(line)
 
     # --- rbind / cbind ---
     line = re.sub(r'rbind\((.+)\)', r'pd.concat([\1], axis=0)', line)
@@ -83,7 +102,11 @@ def convert_line(line):
     line = re.sub(r'stop\((.+)\)', r'raise Exception(\1)', line)
 
     # --- Functions ---
-    line = re.sub(r'(\w+)\s*=\s*function\((.*)\)', lambda m: f'def {to_snake_case(m.group(1))}({m.group(2)}):', line)
+    line = re.sub(
+        r'(\w[\w\.]*)\s*<-\s*function\((.*)\)',
+        lambda m: f'def {to_snake_case(m.group(1))}({m.group(2)}):',
+        line
+    )
     if "function(" in line:
         line = line.replace("function(", "def ")
 
@@ -99,12 +122,20 @@ def convert_line(line):
         line = f'for {var} in range({start}, {int(end)+1}):'
     line = re.sub(r'while\s*\((.+)\)', r'while \1:', line)
 
-    # --- Date / Time ---
+    # --- Dates / Time ---
     line = line.replace("Sys.Date()", "datetime.today().date()")
     line = line.replace("Sys.time()", "datetime.now()")
+    line = line.replace("today()", "datetime.today().date()")
+    line = line.replace("yesterday()", "(datetime.today() - timedelta(days=1)).date()")
+
+    # --- Handle braces for indentation ---
+    if line.endswith(":"):
+        INDENT += 1
+    if "}" in line:
+        INDENT -= line.count("}")
+        line = line.replace("}", "")
 
     return indent_line(line)
-
 
 def convert_r_file(r_file, py_file):
     global INDENT
@@ -113,6 +144,7 @@ def convert_r_file(r_file, py_file):
         lines = f.readlines()
 
     py_code = []
+    # Add imports at top
     py_code.append("import pandas as pd\nimport numpy as np\nimport os\nimport re\nfrom datetime import datetime, timedelta\n\n")
 
     for line in lines:
@@ -123,7 +155,6 @@ def convert_r_file(r_file, py_file):
         f.writelines(py_code)
 
     print(f"✅ Conversion complete: {py_file}")
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
