@@ -13,10 +13,11 @@ def to_snake_case(name: str) -> str:
 
 def preserve_strings(code: str):
     """
-    Mask all string literals ("..." or '...') to __STR_n__ placeholders.
+    Mask all string literals ("..." or '...') to placeholders __STR_n__
+    so regex transforms don’t corrupt them.
     """
     strings = {}
-    def repl(m):
+    def replacer(m):
         key = f"__STR_{len(strings)}__"
         strings[key] = m.group(0)
         return key
@@ -24,18 +25,22 @@ def preserve_strings(code: str):
 
 |\\.)*")|('([^'\\]
 
-|\\.)*')''', repl, code)
+|\\.)*')''', replacer, code)
     return masked, strings
 
 def restore_strings(code: str, strings: dict) -> str:
     """
-    Restore placeholders back to original literals (longest keys first).
+    Restore masked string literals by replacing placeholders with originals.
+    Longer keys first to avoid partial overlaps.
     """
     for key in sorted(strings.keys(), key=len, reverse=True):
         code = code.replace(key, strings[key])
     return code
 
 def split_code_and_comment(line: str):
+    """
+    Separate an R line into code and trailing comment.
+    """
     parts = line.split("#", 1)
     if len(parts) == 1:
         return parts[0], ""
@@ -45,10 +50,15 @@ def split_code_and_comment(line: str):
 # Preprocessing
 # -----------------------------
 def preprocess(r_code: str):
+    """
+    1) Mask strings
+    2) Replace <- and -> with =
+    3) Normalize variable names to snake_case (excluding comments)
+    """
     masked, str_map = preserve_strings(r_code)
-    # assignments
+    # Replace assignment arrows
     masked = re.sub(r'(<-|->)', '=', masked)
-    # normalize variable names outside comments
+    # Normalize names line by line
     lines = []
     for ln in masked.split("\n"):
         code_part, comment = split_code_and_comment(ln)
@@ -59,28 +69,74 @@ def preprocess(r_code: str):
     return "\n".join(lines), str_map
 
 # -----------------------------
-# Transformations
+# Transform Functions
 # -----------------------------
+def transform_data_frame_creation(line: str) -> str:
+    """
+    df <- data.frame(a=..., b=..., c=...)
+      → df = pd.DataFrame({"a":..., "b":..., "c":...})
+    """
+    m = re.match(r'(\w+)\s*=\s*data\.frame\s*\((.*)\)\s*$', line)
+    if not m:
+        return line
+    var, body = m.group(1), m.group(2)
+    # Split on top-level commas
+    parts, buf, depth = [], "", 0
+    for ch in body:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        parts.append(buf.strip())
+    cols = []
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            key = to_snake_case(k.strip())
+            cols.append(f'"{key}": {v.strip()}')
+    return f'{var} = pd.DataFrame({{{", ".join(cols)}}})'
+
 def transform_logical_ops(line: str) -> str:
-    # scalar logical
+    # Replace R’s scalar && and || with Python and/or
     line = re.sub(r'&&', 'and', line)
     line = re.sub(r'\|\|', 'or', line)
     return line
 
+def transform_numeric_slice(line: str) -> str:
+    """
+    df3[1:nrow(df), , drop=FALSE] → df3.iloc[:len(df), :]
+    """
+    line = re.sub(
+        r'(\w+)\s*
+
+\[\s*1\s*:\s*nrow\(\s*(\w+)\s*\)\s*,\s*,\s*drop\s*=\s*FALSE\s*\]
+
+',
+        r'\1.iloc[:len(\2), :]', line
+    )
+    return line
+
 def transform_chained_null_drops(line: str) -> str:
     """
-    df$col1 <- df$col2 <- NULL → df.drop(columns=["col1","col2"], inplace=True)
+    df$col1 <- df$col2 <- NULL
+      → df.drop(columns=["col1","col2"], inplace=True)
     """
-    m = re.findall(r'(\w+)\$(\w+)\s*=\s*', line)
+    m = re.findall(r'(\w+)\$(\w+)\s*=', line)
     if m and line.strip().endswith("NULL"):
         dfname = m[0][0]
-        cols = [to_snake_case(c) for (_, c) in m]
+        cols = [to_snake_case(c) for _, c in m]
         cols_list = ", ".join(f'"{c}"' for c in cols)
         return f'{dfname}.drop(columns=[{cols_list}], inplace=True)'
     return line
 
 def transform_new_column_assignment(line: str) -> str:
-    # df$col <- expr → df["col"] = expr
+    # df$col = expr → df["col"] = expr
     return re.sub(
         r'(\w+)\$(\w+)\s*=\s*(.+)',
         lambda m: f'{m.group(1)}["{to_snake_case(m.group(2))}"] = {m.group(3).strip()}',
@@ -88,7 +144,10 @@ def transform_new_column_assignment(line: str) -> str:
     )
 
 def transform_na_fill(line: str) -> str:
-    # df$col[is.na(df$col)] <- val → df.loc[df["col"].isna(), "col"] = val
+    """
+    df$col[is.na(df$col)] = val
+      → df.loc[df["col"].isna(), "col"] = val
+    """
     return re.sub(
         r'(\w+)\$(\w+)\s*
 
@@ -107,6 +166,22 @@ def transform_ifelse(line: str) -> str:
         line
     )
 
+def transform_unique(line: str) -> str:
+    # unique(df$col) → df["col"].unique()
+    return re.sub(r'unique\(\s*(\w+)\$(\w+)\s*\)', r'\1["\2"].unique()', line)
+
+def transform_element_assignment(line: str) -> str:
+    # df$col[i] = val → df.loc[i-1, "col"] = val
+    return re.sub(
+        r'(\w+)\$(\w+)\s*
+
+\[\s*(\w+)\s*\]
+
+\s*=\s*(.+)',
+        r'\1.loc[\3-1, "\2"] = \4',
+        line
+    )
+
 def transform_functions(line: str) -> str:
     line = re.sub(r'(\w+)\s*=\s*function\s*\((.*?)\)', r'def \1(\2):', line)
     line = re.sub(r'return\((.*?)\)', r'return \1', line)
@@ -114,11 +189,19 @@ def transform_functions(line: str) -> str:
     return line
 
 def transform_default_sysdate(line: str) -> str:
-    # myfunc <- function(x = Sys.Date()) → def myfunc(x=None):
-    line = re.sub(
+    # function(x = Sys.Date()) → def func(x=None):
+    return re.sub(
         r'(\w+)\s*=\s*function\s*\(\s*(\w+)\s*=\s*Sys\.Date\(\)\s*\)',
-        r'def \1(\2=None):', line
+        r'def \1(\2=None):',
+        line
     )
+
+def transform_s3_methods(line: str) -> str:
+    # print.classname <- function(self) → class Classname: def __str__(self):
+    m = re.match(r'print\.(\w+)\s*=\s*function\s*\(\s*self\s*\)', line)
+    if m:
+        cls = m.group(1).capitalize()
+        return f'class {cls}:\n    def __str__(self):'
     return line
 
 def transform_control(line: str) -> str:
@@ -137,53 +220,55 @@ def transform_vectors(line: str) -> str:
         if st:
             return f'range({s}, {e}+1, {st})'
         return f'range({s}, {e}+1)'
-    return re.sub(
-        r'seq\(\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)', seq_repl, line
-    )
+    return re.sub(r'seq\(\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\)', seq_repl, line)
 
 def transform_dataframe_access_and_names(line: str) -> str:
-    # df$col → df["col"]
     line = re.sub(r'(\w+)\$(\w+)', r'\1["\2"]', line)
-    # names(df) <- c(...) and names(df)
     line = re.sub(r'names\((\w+)\)\s*=\s*c\((.*?)\)', r'\1.columns = [\2]', line)
     line = re.sub(r'names\((\w+)\)', r'\1.columns.tolist()', line)
     return line
 
 def transform_dataframe_subsetting(line: str) -> str:
-    # df["col_list"]
-    line = re.sub(
-        r'(\w+)\s*
-
-\[\s*,\s*
-
-\[\s*(.*?)\s*\]
-
-\s*\]
-
-', r'\1[[\2]]', line
-    )
-    # df[, "col"]
+    # subset(df, select=c(...))
+    line = re.sub(r'subset\(\s*(\w+)\s*,\s*select\s*=\s*c\((.*?)\)\s*\)', r'\1[[\2]]', line)
+    # df[, c(...)]
     line = re.sub(r'(\w+)\s*
 
-\[\s*,\s*["\'](.+?)["\']\s*\]
+\[\s*,\s*c\((.*?)\)\s*\]
 
-', r'\1["\2"]', line)
+', r'\1[[\2]]', line)
+    # df[, var]
+    line = re.sub(r'(\w+)\s*
+
+\[\s*,\s*(\w+)\s*\]
+
+', r'\1[\2]', line)
+    # df[cond, c(...)]
+    line = re.sub(r'(\w+)\s*
+
+\[\s*(.*?)\s*,\s*c\((.*?)\)\s*\]
+
+', r'\1.loc[\2, [\3]]', line)
+    # df[cond, var]
+    line = re.sub(r'(\w+)\s*
+
+\[\s*(.*?)\s*,\s*(\w+)\s*\]
+
+', r'\1.loc[\2, \3]', line)
     # df[cond, ]
     line = re.sub(r'(\w+)\s*
 
 \[\s*(.*?)\s*,\s*\]
 
-', r'\1.loc[\2, :]', line)
+\s*', r'\1.loc[\2, :]', line)
     return line
 
 def transform_dataframe_drops(line: str) -> str:
-    # handle single-col NULL drop: df$col <- NULL
-    line = re.sub(
+    return re.sub(
         r'(\w+)\$(\w+)\s*=\s*NULL',
         lambda m: f'{m.group(1)}.drop(columns=["{m.group(2)}"], inplace=True)',
         line
     )
-    return line
 
 def transform_dataframe_rbind_cbind(line: str) -> str:
     line = re.sub(r'rbind\((.*?)\)', r'pd.concat([\1], axis=0)', line)
@@ -193,44 +278,71 @@ def transform_dataframe_rbind_cbind(line: str) -> str:
 def handle_merge(line: str) -> str:
     if "merge(" not in line:
         return line
-    m = re.search(r'merge\(\s*([^,]+)\s*,\s*([^,)\s]+)(.*?)\)', line)
+    m = re.search(r'merge\(\s*(.*)\s*\)', line)
     if not m:
         return line
-    left, right, rest = m.group(1).strip(), m.group(2).strip(), m.group(3)
-    how = 'inner'
-    if re.search(r'all\.x\s*=\s*TRUE', rest): how = 'left'
-    if re.search(r'all\.y\s*=\s*TRUE', rest): how = 'right'
-    if re.search(r'all\s*=\s*TRUE', rest): how = 'outer'
-    on = left_on = right_on = None
-    m_on = re.search(r'by\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_on: on = to_snake_case(m_on.group(1))
-    m_l = re.search(r'by\.x\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_l: left_on = to_snake_case(m_l.group(1))
-    m_r = re.search(r'by\.y\s*=\s*["\']([\w\.]+)["\']', rest)
-    if m_r: right_on = to_snake_case(m_r.group(1))
-    right = re.sub(r'(\w+)
-
-\[(.*?),(.*?)\]
-
-', r'\1.loc[\2,\3]', right)
-    args = [left, right, f'how="{how}"']
-    if on: args.append(f'on="{on}"')
-    if left_on: args.append(f'left_on="{left_on}"')
-    if right_on: args.append(f'right_on="{right_on}"')
-    py = f'pd.merge({", ".join(args)})'
-    return line.replace(m.group(0), py)
+    body = m.group(1)
+    # split on top-level commas
+    parts, buf, depth = [], "", 0
+    for ch in body:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        parts.append(buf.strip())
+    left_df, right_df = parts[0], parts[1]
+    how = "inner"
+    on = []
+    left_on = right_on = None
+    for arg in parts[2:]:
+        if "=" not in arg:
+            continue
+        k, v = [x.strip() for x in arg.split("=", 1)]
+        if k == "all.x" and v in ("TRUE", "True"):
+            how = "left"
+        elif k == "all.y" and v in ("TRUE", "True"):
+            how = "right"
+        elif k == "all" and v in ("TRUE", "True"):
+            how = "outer"
+        elif k == "by":
+            if v.startswith("c("):
+                cols = re.findall(r'["\'](.*?)["\']', v)
+                on = [to_snake_case(c) for c in cols]
+            else:
+                single = re.match(r'["\'](.+?)["\']', v).group(1)
+                on = [to_snake_case(single)]
+        elif k == "by.x":
+            left_on = to_snake_case(re.match(r'["\'](.+?)["\']', v).group(1))
+        elif k == "by.y":
+            right_on = to_snake_case(re.match(r'["\'](.+?)["\']', v).group(1))
+    # inline subsets already converted to .loc[...] earlier
+    args = [left_df, right_df]
+    kw = []
+    if on:
+        kw.append(f'on={[f\'"{c}"\' for c in on]}')
+    if left_on and right_on:
+        kw.append(f'left_on="{left_on}"')
+        kw.append(f'right_on="{right_on}"')
+    kw.append(f'how="{how}"')
+    pandas_call = f'{left_df}.merge({right_df}, ' + ", ".join(kw) + ')'
+    return line.replace(m.group(0), pandas_call)
 
 def transform_sorting(line: str) -> str:
-    # df[order(df$col), ]
     line = re.sub(
         r'(\w+)\s*
 
 \[\s*order\(\s*\1\$(\w+)\s*\)\s*,\s*\]
 
-', r'\1.sort_values(by="\2")',
+',
+        r'\1.sort_values(by="\2")',
         line
     )
-    # df[order(df$col, decreasing=TRUE), ]
     line = re.sub(
         r'(\w+)\s*
 
@@ -271,13 +383,22 @@ def transform_df_counts_and_summary(line: str) -> str:
     return line
 
 def transform_aggregation(line: str) -> str:
-    line = re.sub(r'mean\(\s*(\w+)\$(\w+),\s*na\.rm\s*=\s*TRUE\)', r'\1["\2"].mean(skipna=True)', line)
-    line = re.sub(r'sum\(\s*(\w+)\$(\w+),\s*na\.rm\s*=\s*TRUE\)', r'\1["\2"].sum(skipna=True)', line)
+    line = re.sub(
+        r'mean\(\s*(\w+)\$(\w+)\s*,\s*na\.rm\s*=\s*TRUE\)',
+        r'\1["\2"].mean(skipna=True)', line
+    )
+    line = re.sub(
+        r'sum\(\s*(\w+)\$(\w+)\s*,\s*na\.rm\s*=\s*TRUE\)',
+        r'\1["\2"].sum(skipna=True)', line
+    )
     return line
 
 def transform_apply_family(line: str) -> str:
     line = re.sub(r'apply\(\s*(\w+)\s*,\s*1\s*,\s*(\w+)\)', r'\1.\2(axis=1)', line)
-    line = re.sub(r'sapply\(\s*(\w+)\$(\w+)\s*,\s*(\w+)\)', r'\1["\2"].apply(\3)', line)
+    line = re.sub(
+        r'sapply\(\s*(\w+)\$(\w+)\s*,\s*(\w+)\)',
+        r'\1["\2"].apply(\3)', line
+    )
     line = re.sub(
         r'lapply\(\s*(\w+)\s*,\s*function\(\w+\)\s*(\w+)\$(\w+)\)',
         r'[\1_item["\3"] for \1_item in \1]',
@@ -288,8 +409,15 @@ def transform_apply_family(line: str) -> str:
 def transform_io(line: str) -> str:
     line = re.sub(r'read\.csv\((.*?)\)', r'pd.read_csv(\1)', line)
     line = re.sub(r'write\.csv\(\s*(.*?),(.*?)\)', r'\2.to_csv(\1, index=False)', line)
-    line = re.sub(r'list\.files\(\s*pattern\s*=\s*["\'](.*?)["\']\s*\)', r'glob.glob("\1")', line)
-    line = re.sub(r'grep\("(.+?)"\s*,\s*(\w+)\)', r'[x for x in \2 if re.search("\1", x)]', line)
+    line = re.sub(
+        r'list\.files\(\s*pattern\s*=\s*["\'](.*?)["\']\s*\)',
+        r'glob.glob("\1")', line
+    )
+    line = re.sub(
+        r'grep\("(.+?)"\s*,\s*(\w+)\)',
+        r'[x for x in \2 if re.search("\1", x)]',
+        line
+    )
     return line
 
 def transform_dates(line: str) -> str:
@@ -305,16 +433,6 @@ def transform_dates(line: str) -> str:
 def transform_factor(line: str) -> str:
     return re.sub(r'factor\((.*?)\)', r'pd.Categorical(\1)', line)
 
-def transform_s3_methods(line: str) -> str:
-    m = re.match(r'print\.(\w+)\s*=\s*function\s*\(\s*self\s*\)', line)
-    if m:
-        cls = m.group(1).capitalize()
-        return f'class {cls}:\n    def __str__(self):'
-    return line
-
-# -----------------------------
-# Pipe Operator Handling
-# -----------------------------
 def handle_pipe(line: str) -> str:
     if '%>%' not in line:
         return line
@@ -340,9 +458,9 @@ def handle_pipe(line: str) -> str:
                 out.append(f'{current}["{col.strip()}"] = {expr.strip()}')
         elif op == 'arrange':
             cols = [c.strip() for c in args.split(',')]
-            asc = [c[5:-1] for c in cols if c.startswith('desc(')]
-            if asc:
-                out.append(f'{current} = {current}.sort_values(by={asc}, ascending=False)')
+            desc = [c[5:-1] for c in cols if c.startswith('desc(')]
+            if desc:
+                out.append(f'{current} = {current}.sort_values(by={desc}, ascending=False)')
             else:
                 out.append(f'{current} = {current}.sort_values(by={[c for c in cols]})')
         elif op == 'group_by':
@@ -373,7 +491,7 @@ def indent_code(lines, indent_str="    "):
     return out
 
 # -----------------------------
-# Main Conversion Pipeline
+# Conversion Pipeline
 # -----------------------------
 def convert_r_to_python(r_code: str) -> str:
     masked, str_map = preprocess(r_code)
@@ -381,17 +499,19 @@ def convert_r_to_python(r_code: str) -> str:
     for raw in masked.split("\n"):
         code_part, comment = split_code_and_comment(raw)
         ln = code_part
-
         if not ln.strip():
             out_lines.append(raw)
             continue
-
         for fn in (
+            transform_data_frame_creation,
             transform_logical_ops,
+            transform_numeric_slice,
             transform_chained_null_drops,
             transform_new_column_assignment,
             transform_na_fill,
             transform_ifelse,
+            transform_unique,
+            transform_element_assignment,
             transform_functions,
             transform_default_sysdate,
             transform_s3_methods,
@@ -414,15 +534,10 @@ def convert_r_to_python(r_code: str) -> str:
             handle_pipe
         ):
             ln = fn(ln)
-
         out_lines.append(ln + (" " + comment if comment else ""))
-
-    # indent
     indented = indent_code(out_lines)
     joined = "\n".join(indented)
     restored = restore_strings(joined, str_map)
-
-    # final imports
     imports = [
         "import pandas as pd",
         "import numpy as np",
